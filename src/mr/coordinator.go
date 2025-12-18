@@ -1,19 +1,28 @@
 package mr
 
 import (
+	"errors"
 	"log"
 	"net"
 	"net/http"
 	"net/rpc"
 	"os"
+	"strconv"
 	"time"
 )
 
 
+type Phase int
+const (
+	PhaseMap Phase = iota
+	PhaseReduce
+	PhaseDone
+)
 
 type Coordinator struct {
 	mapTasks []Task
 	reduceTasks []Task
+	phase Phase
 }
 
 type TaskStatus int
@@ -23,10 +32,11 @@ const (
 	StatusDone
 )
 
+
 type Task struct {
 	id int
 	status TaskStatus
-	startTime time.Time
+	heartbeatTime time.Time
 	assignedWorkerId string
 
 	fileName string // for map tasks only
@@ -75,6 +85,75 @@ func (c *Coordinator) Done() bool {
 	return ret
 }
 
+func (c *Coordinator) GetIdleTask(req *GetIdleTaskRequest, resp *GetIdleTaskReply) error {
+	for i := range c.mapTasks {
+		task := &c.mapTasks[i]
+		if task.status == StatusIdle {
+			resp.TaskId = task.id
+			resp.TaskType = TypeMap
+			resp.FileName = task.fileName
+
+			task.assignedWorkerId = req.WorkerId
+			task.heartbeatTime = time.Now()
+			task.status = StatusProcessing
+			return nil
+		}
+	}
+
+	for _, task := range c.reduceTasks {
+		if task.status == StatusIdle {
+			resp.TaskId = task.id
+			resp.TaskType = TypeReduce
+
+			task.assignedWorkerId = req.WorkerId
+			task.heartbeatTime = time.Now()
+			task.status = StatusProcessing
+			return nil
+		}
+	}
+
+	return errors.New("no idle task found")
+}
+
+func (c* Coordinator) Heartbeat(req *HeartbeatRequest, resp *HeartbeatReply) error {
+	if req.TaskType == TypeMap {
+		for _, task := range c.mapTasks {
+			if task.id == req.TaskId && task.assignedWorkerId == req.WorkerId {
+				task.heartbeatTime = time.Now()
+				resp.Ok = true
+				return nil
+			}
+		}
+	} else if req.TaskType == TypeReduce {
+		for _, task := range c.reduceTasks {
+			if task.id == req.TaskId && task.assignedWorkerId == req.WorkerId {
+				task.heartbeatTime = time.Now()
+				resp.Ok = true
+				return nil
+			}
+		}
+	} else if req.TaskType == TypeWait || req.TaskType == TypeDone {
+		resp.Ok = true
+		return nil
+	}
+
+	resp.Ok = false
+	return errors.New("invalid task type: " + strconv.Itoa(int(req.TaskType)))
+}
+
+func (c *Coordinator) scheduleTasks() {
+	for {
+		time.Sleep(1 * time.Second)
+
+		for _, task := range c.mapTasks {
+			if task.status == StatusIdle {
+				task.status = StatusProcessing
+				task.startTime = time.Now()
+			}
+		}
+	}
+}
+
 //
 // create a Coordinator.
 // main/mrcoordinator.go calls this function.
@@ -102,6 +181,8 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 			status: StatusIdle, 
 		}
 	}
+
+	go c.scheduleTasks()
 
 	
 

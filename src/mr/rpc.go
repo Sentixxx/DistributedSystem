@@ -6,13 +6,23 @@ package mr
 // remember to capitalize all names.
 //
 
-import "os"
-import "strconv"
+import (
+	"os"
+	"strconv"
+)
 
 //
 // example to show how to declare the arguments
 // and reply for an RPC.
 //
+
+type TaskType int
+const (
+	TypeMap TaskType = iota
+	TypeReduce
+	TypeWait
+	TypeDone
+)
 
 type ExampleArgs struct {
 	X int
@@ -20,6 +30,26 @@ type ExampleArgs struct {
 
 type ExampleReply struct {
 	Y int
+}
+
+type GetIdleTaskRequest struct {
+	WorkerId string
+}
+
+type GetIdleTaskReply struct {
+	TaskId int
+	TaskType TaskType
+	FileName string
+}
+
+type HeartbeatRequest struct {
+	WorkerId string
+	TaskId int
+	TaskType TaskType
+}
+
+type HeartbeatReply struct {
+	Ok bool
 }
 
 // Add your RPC definitions here.
