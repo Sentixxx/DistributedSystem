@@ -17,6 +17,7 @@ import (
 //
 
 type TaskType int
+
 const (
 	TypeMap TaskType = iota
 	TypeReduce
@@ -37,23 +38,32 @@ type GetIdleTaskRequest struct {
 }
 
 type GetIdleTaskReply struct {
-	TaskId int
+	TaskId   int
 	TaskType TaskType
 	FileName string
 }
 
 type HeartbeatRequest struct {
 	WorkerId string
-	TaskId int
+	TaskId   int
 	TaskType TaskType
 }
 
 type HeartbeatReply struct {
-	Ok bool
+	Reset bool
+}
+
+type FinishTaskRequest struct {
+	WorkerId string
+	TaskId   int
+	TaskType TaskType
+}
+
+type FinishTaskReply struct {
+	Reset bool
 }
 
 // Add your RPC definitions here.
-
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
