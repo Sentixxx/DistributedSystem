@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/rpc"
 	"os"
+	"strconv"
 	"time"
 )
 
@@ -22,7 +23,7 @@ type Coordinator struct {
 	mapTasks    []Task
 	reduceTasks []Task
 	phase       Phase
-
+	workerId int
 	taskChan chan TaskEvent
 }
 
@@ -32,6 +33,7 @@ const (
 	TaskEventAssign TaskEventType = iota
 	TaskEventHeartbeat
 	TaskEventComplete
+	TaskEventInit
 )
 
 type TaskEvent struct {
@@ -81,7 +83,6 @@ func (c *Coordinator) Done() bool {
 	return c.phase == PhaseDone
 }
 
-// GetIdleTask handles RPC request to get an idle task
 func (c *Coordinator) GetIdleTask(req *GetIdleTaskRequest, resp *GetIdleTaskReply) error {
 	taskEvent := TaskEvent{
 		TaskEventType: TaskEventAssign,
@@ -94,21 +95,38 @@ func (c *Coordinator) GetIdleTask(req *GetIdleTaskRequest, resp *GetIdleTaskRepl
 	return nil
 }
 
-func (c *Coordinator) Heartbeat(req *HeartbeatRequest, resp *HeartbeatReply) error {
-	taskEvent := TaskEvent{
-		TaskEventType: TaskEventHeartbeat,
-		WorkerId:      req.WorkerId,
-		TaskId:        req.TaskId,
-		TaskType:      req.TaskType,
-		Reply:         &resp,
+func (c *Coordinator) GetUid(req *GetUidRequest, resp *GetUidReply) error {
+	taskEvent := TaskEvent {
+		TaskEventType: TaskEventInit,
+		Reply: &resp,
+		ok: make(chan struct{}),
 	}
-
 	c.taskChan <- taskEvent
 	<-taskEvent.ok
+
 	return nil
 }
 
-// Internal method to handle task assignment (runs in a single goroutine)
+// Heartbeat handles RPC request to update task heartbeat
+func (c *Coordinator) Heartbeat(req *HeartbeatRequest, resp *HeartbeatReply) error {
+	log.Printf("Coordinator: Heartbeat received from worker %s for task %d of type %s", req.WorkerId, req.TaskId, req.TaskType)
+	defer log.Printf("Coordinator: Hearbeat finish from from worker %s for task %d of type %s", req.WorkerId, req.TaskId, req.TaskType)
+
+	taskEvent := TaskEvent{
+		TaskEventType: TaskEventHeartbeat,
+		TaskId:        req.TaskId,
+		TaskType:      req.TaskType,
+		WorkerId:      req.WorkerId,
+		Reply: &resp,
+		ok:            make(chan struct{}),
+	}
+	c.taskChan <- taskEvent
+	<-taskEvent.ok
+
+	return nil
+}
+
+
 func (c *Coordinator) assignIdleTask(workerId string, resp *GetIdleTaskReply) (*GetIdleTaskReply, error) {
 	if c.phase == PhaseMap {
 		for i := range c.mapTasks {
@@ -225,26 +243,17 @@ func (c *Coordinator) eventLoop() {
 				resp := event.Reply.(*FinishTaskReply)
 				c.completeTask(event.WorkerId, event.TaskId, event.TaskType, resp)
 				close(event.ok)
+			case TaskEventInit:
+				resp := event.Reply.(*GetUidReply)
+				resp.Uid = strconv.Itoa(c.workerId)
+				c.workerId++
+				close(event.ok)
 			}
 		}
 	}
 }
 
-// Heartbeat handles RPC request to update task heartbeat
-func (c *Coordinator) Heartbeat(req *HeartbeatRequest, resp *HeartbeatReply) error {
-	log.Printf("Coordinator: Heartbeat received from worker %s for task %d of type %s", req.WorkerId, req.TaskId, req.TaskType)
-	taskEvent := TaskEvent{
-		TaskEventType: TaskEventHeartbeat,
-		TaskId:        req.TaskId,
-		TaskType:      req.TaskType,
-		WorkerId:      req.WorkerId,
-		ok:            make(chan struct{}),
-	}
-	c.taskChan <- taskEvent
-	<-taskEvent.ok
 
-	return nil
-}
 
 // Internal method to update heartbeat (runs in a single goroutine)
 func (c *Coordinator) updateHeartbeat(workerId string, taskId int, taskType TaskType, resp *HeartbeatReply) (bool, error) {
@@ -287,12 +296,14 @@ func (c *Coordinator) updateHeartbeat(workerId string, taskId int, taskType Task
 // main/mrcoordinator.go calls this function.
 // nReduce is the number of reduce tasks to use.
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
-	c := Coordinator{}
-
-	// Your code here.
+	c := Coordinator{
+		workerId: 0,
+		mapTasks: make([]Task, len(files)),
+		reduceTasks: make([]Task, nReduce),
+		taskChan: make(chan TaskEvent),
+	}
 
 	// Init tasks
-	c.mapTasks = make([]Task, len(files))
 	for i, filename := range files {
 		c.mapTasks[i] = Task{
 			id:       i,
@@ -301,7 +312,6 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 		}
 	}
 
-	c.reduceTasks = make([]Task, nReduce)
 	for i := 0; i < nReduce; i++ {
 		c.reduceTasks[i] = Task{
 			id:     i,
@@ -311,7 +321,6 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 
 	// Initialize operation channel and start handler
 	// This handler will serialize all operations that access shared state
-	c.taskChan = make(chan TaskEvent)
 	go c.eventLoop()
 
 	c.server()

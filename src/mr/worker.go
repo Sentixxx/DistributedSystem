@@ -1,10 +1,15 @@
 package mr
 
 import (
+	"encoding/json"
 	"fmt"
 	"hash/fnv"
+	"io"
 	"log"
 	"net/rpc"
+	"os"
+	"sort"
+	"time"
 )
 
 // Map functions return a slice of KeyValue.
@@ -21,41 +26,153 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-// main/mrworker.go calls this function.
-func Worker(mapf func(string, string) []KeyValue,
-	reducef func(string, []string) string) {
+func doMapTask(mapf func(string, string) []KeyValue, resp *GetIdleTaskReply, workerId string) {
+	filename := resp.FileName
+	file, err := os.Open(filename)
+	if err != nil {
+		log.Fatalf("worker %s | doMapTask | cannot open file %v", workerId, filename)
+	}
+	defer file.Close()
+	content, err := io.ReadAll(file)
+	if err != nil {
+		log.Fatalf("worker %s | doMapTask | cannot read file %v", workerId, filename)
+	}
 
-	// Your worker implementation here.
+	kva := mapf(filename, string(content))
+	intermediate := make([][]KeyValue, resp.NReduce)
+	for _, kv := range kva {
+		index := ihash(kv.Key) % resp.NReduce
+		intermediate[index] = append(intermediate[index], kv)
+	}
 
-	// uncomment to send the Example RPC to the coordinator.
-	// CallExample()
+	for i := 0; i < resp.NReduce; i++ {
+		sort.Slice(intermediate[i], func(j, k int) bool {
+			return intermediate[i][j].Key < intermediate[i][k].Key
+		})
+		filename := fmt.Sprintf("mr-%d-%d", resp.TaskId, i)
+		tmpfile, err := os.Create(filename)
+		if err != nil {
+			log.Fatalf("worker %s | doMapTask | cannot create file %v", workerId, filename)
+		}
+		defer tmpfile.Close()
+
+		encoding := json.NewEncoder(tmpfile)
+		for _, kv := range intermediate[i] {
+			err := encoding.Encode(kv)
+			if err != nil {
+				log.Fatalf("worker %s | doMapTask | cannot encode kv %v", workerId, kv)
+			}
+		}
+	}
 
 }
 
-// example function to show how to make an RPC call to the coordinator.
-//
-// the RPC argument and reply types are defined in rpc.go.
-func CallExample() {
+func doReduceTask(reducef func(string, []string) string) {
 
-	// declare an argument structure.
-	args := ExampleArgs{}
+}
 
-	// fill in the argument(s).
-	args.X = 99
+// main/mrworker.go calls this function.
+func Worker(mapf func(string, string) []KeyValue,
+	reducef func(string, []string) string) {
+	var workerId string
+	for {
+		req := GetUidRequest{}
+		reply := GetUidReply{}
+		ok := call("Coordinator.GetUid", &req, &reply)
+		if ok {
+			workerId = reply.Uid
+			break
+		} else {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+	}
 
-	// declare a reply structure.
-	reply := ExampleReply{}
+	var taskId int = -1
+	var taskType TaskType
+	var reset bool = false
+	var complete bool = false
 
-	// send the RPC request, wait for the reply.
-	// the "Coordinator.Example" tells the
-	// receiving server that we'd like to call
-	// the Example() method of struct Coordinator.
-	ok := call("Coordinator.Example", &args, &reply)
-	if ok {
-		// reply.Y should be 100.
-		fmt.Printf("reply.Y %v\n", reply.Y)
-	} else {
-		fmt.Printf("call failed!\n")
+	go func() {
+		for {
+			//stage 1: get idle task
+			req := GetIdleTaskRequest{
+				WorkerId: workerId,
+			}
+			reply := GetIdleTaskReply{}
+			TrySend(func() bool {
+				return call("Coordinator.GetIdleTask", &req, &reply)
+			}, 100)
+			taskId = reply.TaskId
+			taskType = reply.TaskType
+			if reset {
+				continue
+			}
+
+			//stage 2: do task
+			switch taskType {
+			case TypeMap:
+				doMapTask(mapf, &reply, workerId)
+			case TypeReduce:
+				doReduceTask(taskId, taskType, workerId)
+			case TypeWait:
+				time.Sleep(1 * time.Second)
+				continue
+			case TypeDone:
+				complete = true
+				break
+			}
+
+			//stage 3: finish task
+			finishTaskReq := FinishTaskRequest{
+				WorkerId: workerId,
+				TaskId:   taskId,
+				TaskType: taskType,
+			}
+			finishTaskReply := FinishTaskReply{}
+			TrySend(func() bool {
+				return call("Coordinator.FinishTask", &finishTaskReq, &finishTaskReply)
+			}, 100)
+			reset = finishTaskReply.Reset
+			if reset {
+				continue
+			}
+		}
+	}()
+
+	for {
+		if taskId == -1 {
+			continue
+		}
+
+		heartbeatReq := HeartbeatRequest{
+			WorkerId: workerId,
+			TaskId:   taskId,
+			TaskType: taskType,
+		}
+		heartbeatReply := HeartbeatReply{}
+		TrySend(func() bool {
+			return call("Coordinator.Heartbeat", &heartbeatReq, &heartbeatReply)
+		}, 100)
+		reset = heartbeatReply.Reset
+
+		if complete {
+			break
+		}
+
+		time.Sleep(1 * time.Second)
+	}
+
+}
+
+func TrySend(fn func() bool, waitTime time.Duration) error {
+	for {
+		ok := fn()
+		if ok {
+			return nil
+		} else {
+			time.Sleep(waitTime * time.Millisecond)
+		}
 	}
 }
 

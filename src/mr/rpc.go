@@ -25,12 +25,10 @@ const (
 	TypeDone
 )
 
-type ExampleArgs struct {
-	X int
-}
+type GetUidRequest struct{}
 
-type ExampleReply struct {
-	Y int
+type GetUidReply struct {
+	Uid string
 }
 
 type GetIdleTaskRequest struct {
@@ -41,6 +39,7 @@ type GetIdleTaskReply struct {
 	TaskId   int
 	TaskType TaskType
 	FileName string
+	NReduce  int
 }
 
 type HeartbeatRequest struct {
