@@ -1,4 +1,4 @@
-module 6.5840
+module distributed-systems
 
 go 1.21
 

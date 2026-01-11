@@ -4,10 +4,12 @@ package main
 // see directions in pbc.go
 //
 
-import "time"
-import "6.5840/pbservice"
-import "os"
-import "fmt"
+import (
+	"distributed-systems/pbservice"
+	"fmt"
+	"os"
+	"time"
+)
 
 func main() {
 	if len(os.Args) != 3 {

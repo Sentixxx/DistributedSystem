@@ -6,10 +6,12 @@ package main
 // go build -buildmode=plugin wc.go
 //
 
-import "6.5840/mr"
-import "unicode"
-import "strings"
-import "strconv"
+import (
+	"distributed-systems/mr"
+	"strconv"
+	"strings"
+	"unicode"
+)
 
 // The map function is called once for each file of input. The first
 // argument is the name of the input file, and the second is the

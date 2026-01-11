@@ -9,10 +9,12 @@ package main
 // Please do not change this file.
 //
 
-import "6.5840/mr"
-import "time"
-import "os"
-import "fmt"
+import (
+	"distributed-systems/mr"
+	"fmt"
+	"os"
+	"time"
+)
 
 func main() {
 	if len(os.Args) < 2 {
