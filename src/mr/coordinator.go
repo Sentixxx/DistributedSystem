@@ -23,8 +23,8 @@ type Coordinator struct {
 	mapTasks    []Task
 	reduceTasks []Task
 	phase       Phase
-	workerId int
-	taskChan chan TaskEvent
+	workerId    int
+	taskChan    chan TaskEvent
 }
 
 type TaskEventType int
@@ -87,7 +87,7 @@ func (c *Coordinator) GetIdleTask(req *GetIdleTaskRequest, resp *GetIdleTaskRepl
 	taskEvent := TaskEvent{
 		TaskEventType: TaskEventAssign,
 		WorkerId:      req.WorkerId,
-		Reply:         &resp,
+		Reply:         resp,
 		ok:            make(chan struct{}),
 	}
 	c.taskChan <- taskEvent
@@ -96,10 +96,10 @@ func (c *Coordinator) GetIdleTask(req *GetIdleTaskRequest, resp *GetIdleTaskRepl
 }
 
 func (c *Coordinator) GetUid(req *GetUidRequest, resp *GetUidReply) error {
-	taskEvent := TaskEvent {
+	taskEvent := TaskEvent{
 		TaskEventType: TaskEventInit,
-		Reply: &resp,
-		ok: make(chan struct{}),
+		Reply:         resp,
+		ok:            make(chan struct{}),
 	}
 	c.taskChan <- taskEvent
 	<-taskEvent.ok
@@ -117,7 +117,7 @@ func (c *Coordinator) Heartbeat(req *HeartbeatRequest, resp *HeartbeatReply) err
 		TaskId:        req.TaskId,
 		TaskType:      req.TaskType,
 		WorkerId:      req.WorkerId,
-		Reply: &resp,
+		Reply:         resp,
 		ok:            make(chan struct{}),
 	}
 	c.taskChan <- taskEvent
@@ -126,6 +126,24 @@ func (c *Coordinator) Heartbeat(req *HeartbeatRequest, resp *HeartbeatReply) err
 	return nil
 }
 
+// FinishTask handles RPC request to report task completion
+func (c *Coordinator) FinishTask(req *FinishTaskRequest, resp *FinishTaskReply) error {
+	log.Printf("Coordinator: FinishTask received from worker %s for task %d of type %s", req.WorkerId, req.TaskId, req.TaskType)
+
+	taskEvent := TaskEvent{
+		TaskEventType: TaskEventComplete,
+		TaskId:        req.TaskId,
+		TaskType:      req.TaskType,
+		WorkerId:      req.WorkerId,
+		Reply:         resp,
+		ok:            make(chan struct{}),
+	}
+	c.taskChan <- taskEvent
+	<-taskEvent.ok
+
+	log.Printf("Coordinator: FinishTask completed for worker %s, task %d, reset=%v", req.WorkerId, req.TaskId, resp.Reset)
+	return nil
+}
 
 func (c *Coordinator) assignIdleTask(workerId string, resp *GetIdleTaskReply) (*GetIdleTaskReply, error) {
 	if c.phase == PhaseMap {
@@ -139,9 +157,14 @@ func (c *Coordinator) assignIdleTask(workerId string, resp *GetIdleTaskReply) (*
 				resp.TaskId = task.id
 				resp.TaskType = TypeMap
 				resp.FileName = task.fileName
+				resp.NMap = len(c.mapTasks)
+				resp.NReduce = len(c.reduceTasks)
 				return resp, nil
 			}
 		}
+		// No idle map task, but map phase is not done yet, return TypeWait
+		resp.TaskType = TypeWait
+		return resp, nil
 	} else if c.phase == PhaseReduce {
 		for i := range c.reduceTasks {
 			task := &c.reduceTasks[i]
@@ -152,42 +175,76 @@ func (c *Coordinator) assignIdleTask(workerId string, resp *GetIdleTaskReply) (*
 
 				resp.TaskId = task.id
 				resp.TaskType = TypeReduce
+				resp.NMap = len(c.mapTasks)
+				resp.NReduce = len(c.reduceTasks)
 				return resp, nil
 			}
 		}
+		// No idle reduce task, but reduce phase is not done yet, return TypeWait
+		resp.TaskType = TypeWait
+		return resp, nil
+	} else if c.phase == PhaseDone {
+		// All tasks are done
+		resp.TaskType = TypeDone
+		return resp, nil
 	}
 
+	// Should not reach here
+	resp.TaskType = TypeWait
 	return resp, nil
 }
 
 func (c *Coordinator) checkTasks() {
 	now := time.Now()
 	timeoutS := 10 * time.Second
-	done := true
-	for i := range c.mapTasks {
-		task := &c.mapTasks[i]
-		if task.status != StatusDone {
-			done = false
+
+	// Check map tasks
+	if c.phase == PhaseMap {
+		mapDone := true
+		for i := range c.mapTasks {
+			task := &c.mapTasks[i]
+			if task.status == StatusProcessing && now.Sub(task.heartbeatTime) > timeoutS {
+				task.status = StatusIdle
+				task.assignedWorkerId = ""
+			}
 		}
-		if task.status == StatusProcessing && now.Sub(task.heartbeatTime) > timeoutS {
-			task.status = StatusIdle
-			task.assignedWorkerId = ""
+
+		for i := range c.mapTasks {
+			task := &c.mapTasks[i]
+			if task.status != StatusDone {
+				mapDone = false
+			}
+		}
+
+		// If all map tasks are done, switch to reduce phase
+		if mapDone {
+			c.phase = PhaseReduce
+			log.Printf("Coordinator: All map tasks completed, switching to reduce phase")
 		}
 	}
 
-	for i := range c.reduceTasks {
-		task := &c.reduceTasks[i]
-		if task.status != StatusDone {
-			done = false
-		}
-		if task.status == StatusProcessing && now.Sub(task.heartbeatTime) > timeoutS {
-			task.status = StatusIdle
-			task.assignedWorkerId = ""
-		}
-	}
+	if c.phase == PhaseReduce {
 
-	if done {
-		c.phase = PhaseDone
+		// Check reduce tasks
+		reduceDone := true
+		for i := range c.reduceTasks {
+			task := &c.reduceTasks[i]
+			if task.status == StatusProcessing && now.Sub(task.heartbeatTime) > timeoutS {
+				task.status = StatusIdle
+				task.assignedWorkerId = ""
+			}
+		}
+
+		for i := range c.reduceTasks {
+			task := &c.reduceTasks[i]
+			if task.status != StatusDone {
+				reduceDone = false
+			}
+		}
+		if reduceDone {
+			c.phase = PhaseDone
+			log.Printf("Coordinator: All reduce tasks completed, switching to done phase")
+		}
 	}
 }
 
@@ -196,24 +253,36 @@ func (c *Coordinator) completeTask(workerId string, taskId int, taskType TaskTyp
 		for i := range c.mapTasks {
 			task := &c.mapTasks[i]
 			if task.id == taskId {
-				if workerId == task.assignedWorkerId {
+				// If task is already done, ignore the completion request
+				if task.status == StatusDone {
+					resp.Reset = true
+					return nil
+				}
+				if workerId == task.assignedWorkerId && task.status == StatusProcessing {
 					task.status = StatusDone
 					resp.Reset = false
+
 				} else {
 					resp.Reset = true
 				}
+				return nil
 			}
 		}
 	} else if taskType == TypeReduce {
 		for i := range c.reduceTasks {
 			task := &c.reduceTasks[i]
 			if task.id == taskId {
-				if workerId == task.assignedWorkerId {
+				if task.status == StatusDone {
+					resp.Reset = true
+					return nil
+				}
+				if workerId == task.assignedWorkerId && task.status == StatusProcessing {
 					task.status = StatusDone
 					resp.Reset = false
 				} else {
 					resp.Reset = true
 				}
+				return nil
 			}
 		}
 	}
@@ -253,8 +322,6 @@ func (c *Coordinator) eventLoop() {
 	}
 }
 
-
-
 // Internal method to update heartbeat (runs in a single goroutine)
 func (c *Coordinator) updateHeartbeat(workerId string, taskId int, taskType TaskType, resp *HeartbeatReply) (bool, error) {
 	if taskType == TypeMap {
@@ -263,10 +330,12 @@ func (c *Coordinator) updateHeartbeat(workerId string, taskId int, taskType Task
 			if task.id == taskId {
 				if task.assignedWorkerId == workerId {
 					task.heartbeatTime = time.Now()
+					resp.Reset = false
 					return true, nil
 
 				} else {
 					// 当前任务被分配给了其他 worker
+					resp.Reset = true
 					return false, nil
 				}
 			}
@@ -277,10 +346,12 @@ func (c *Coordinator) updateHeartbeat(workerId string, taskId int, taskType Task
 			if task.id == taskId {
 				if task.assignedWorkerId == workerId {
 					task.heartbeatTime = time.Now()
+					resp.Reset = false
 					return true, nil
 
 				} else {
 					// 当前任务被分配给了其他 worker
+					resp.Reset = true
 					return false, nil
 				}
 			}
@@ -297,10 +368,11 @@ func (c *Coordinator) updateHeartbeat(workerId string, taskId int, taskType Task
 // nReduce is the number of reduce tasks to use.
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{
-		workerId: 0,
-		mapTasks: make([]Task, len(files)),
+		workerId:    0,
+		mapTasks:    make([]Task, len(files)),
 		reduceTasks: make([]Task, nReduce),
-		taskChan: make(chan TaskEvent),
+		taskChan:    make(chan TaskEvent),
+		phase:       PhaseMap,
 	}
 
 	// Init tasks

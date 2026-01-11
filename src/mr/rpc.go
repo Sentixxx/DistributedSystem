@@ -40,6 +40,7 @@ type GetIdleTaskReply struct {
 	TaskType TaskType
 	FileName string
 	NReduce  int
+	NMap     int
 }
 
 type HeartbeatRequest struct {

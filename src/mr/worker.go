@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/rpc"
 	"os"
+	"path/filepath"
 	"sort"
 	"time"
 )
@@ -50,25 +51,116 @@ func doMapTask(mapf func(string, string) []KeyValue, resp *GetIdleTaskReply, wor
 			return intermediate[i][j].Key < intermediate[i][k].Key
 		})
 		filename := fmt.Sprintf("mr-%d-%d", resp.TaskId, i)
-		tmpfile, err := os.Create(filename)
-		if err != nil {
-			log.Fatalf("worker %s | doMapTask | cannot create file %v", workerId, filename)
+
+		// Use atomic write: create temp file, write, then rename
+		dir, _ := filepath.Split(filename)
+		if dir == "" {
+			dir = "."
 		}
-		defer tmpfile.Close()
+		tmpfile, err := os.CreateTemp(dir, "mr-tmp-*")
+		if err != nil {
+			log.Fatalf("worker %s | doMapTask | cannot create temp file %v", workerId, filename)
+		}
 
 		encoding := json.NewEncoder(tmpfile)
 		for _, kv := range intermediate[i] {
 			err := encoding.Encode(kv)
 			if err != nil {
+				tmpfile.Close()
+				os.Remove(tmpfile.Name())
 				log.Fatalf("worker %s | doMapTask | cannot encode kv %v", workerId, kv)
 			}
+		}
+
+		// Close file before renaming to ensure data is flushed
+		if err := tmpfile.Close(); err != nil {
+			os.Remove(tmpfile.Name())
+			log.Fatalf("worker %s | doMapTask | cannot close temp file %v", workerId, tmpfile.Name())
+		}
+
+		// Atomic rename: only visible after complete write
+		if err := os.Rename(tmpfile.Name(), filename); err != nil {
+			os.Remove(tmpfile.Name())
+			log.Fatalf("worker %s | doMapTask | cannot rename file %v", workerId, filename)
 		}
 	}
 
 }
 
-func doReduceTask(reducef func(string, []string) string) {
+func doReduceTask(reducef func(string, []string) string, resp *GetIdleTaskReply, workerId string) string {
 
+	outputFilename := fmt.Sprintf("mr-out-%d", resp.TaskId)
+
+	intermediate := make([]KeyValue, 0)
+	for i := 0; i < resp.NMap; i++ {
+		filename := fmt.Sprintf("mr-%d-%d", i, resp.TaskId)
+		file, err := os.Open(filename)
+		if err != nil {
+			// File might not exist if map task failed or not completed yet
+			continue
+		}
+
+		decoder := json.NewDecoder(file)
+		for {
+			var kv KeyValue
+			if err := decoder.Decode(&kv); err != nil {
+				break
+			}
+			intermediate = append(intermediate, kv)
+		}
+		file.Close()
+	}
+
+	// Group by key
+	result := make(map[string][]string)
+	for _, kv := range intermediate {
+		result[kv.Key] = append(result[kv.Key], kv.Value)
+	}
+
+	// Sort keys for deterministic output
+	keys := make([]string, 0, len(result))
+	for key := range result {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	filename := outputFilename
+
+	dir, _ := filepath.Split(filename)
+	if dir == "" {
+		dir = "."
+	}
+	f, err := os.CreateTemp(dir, "mr-tmp-*")
+	if err != nil {
+		log.Fatalf("worker %s | doReduceTask | cannot create temp file %v", workerId, filename)
+	}
+
+	// Write output in sorted order
+	for _, key := range keys {
+		output := reducef(key, result[key])
+		fmt.Fprintf(f, "%v %v\n", key, output)
+	}
+
+	// Close file before renaming
+	if err := f.Close(); err != nil {
+		os.Remove(f.Name())
+		log.Fatalf("worker %s | doReduceTask | cannot close temp file %v", workerId, f.Name())
+	}
+
+	// Copy file permissions if target file exists
+	if info, err := os.Stat(filename); err == nil {
+		if err := os.Chmod(f.Name(), info.Mode()); err != nil {
+			os.Remove(f.Name())
+			log.Fatalf("worker %s | doReduceTask | cannot chmod file %v", workerId, filename)
+		}
+	}
+
+	return f.Name()
+}
+
+type TaskContext struct {
+	TaskId   int
+	TaskType TaskType
 }
 
 // main/mrworker.go calls this function.
@@ -88,8 +180,7 @@ func Worker(mapf func(string, string) []KeyValue,
 		}
 	}
 
-	var taskId int = -1
-	var taskType TaskType
+	taskCh := make(chan TaskContext)
 	var reset bool = false
 	var complete bool = false
 
@@ -103,18 +194,21 @@ func Worker(mapf func(string, string) []KeyValue,
 			TrySend(func() bool {
 				return call("Coordinator.GetIdleTask", &req, &reply)
 			}, 100)
-			taskId = reply.TaskId
-			taskType = reply.TaskType
-			if reset {
-				continue
+
+			task := TaskContext{
+				TaskId:   reply.TaskId,
+				TaskType: reply.TaskType,
 			}
 
+			var tmpFile string
 			//stage 2: do task
-			switch taskType {
+			switch task.TaskType {
 			case TypeMap:
+				taskCh <- task
 				doMapTask(mapf, &reply, workerId)
 			case TypeReduce:
-				doReduceTask(taskId, taskType, workerId)
+				taskCh <- task
+				tmpFile = doReduceTask(reducef, &reply, workerId)
 			case TypeWait:
 				time.Sleep(1 * time.Second)
 				continue
@@ -123,44 +217,62 @@ func Worker(mapf func(string, string) []KeyValue,
 				break
 			}
 
-			//stage 3: finish task
-			finishTaskReq := FinishTaskRequest{
-				WorkerId: workerId,
-				TaskId:   taskId,
-				TaskType: taskType,
-			}
-			finishTaskReply := FinishTaskReply{}
-			TrySend(func() bool {
-				return call("Coordinator.FinishTask", &finishTaskReq, &finishTaskReply)
-			}, 100)
-			reset = finishTaskReply.Reset
-			if reset {
-				continue
+			//stage 3: finish task (only for actual tasks, not TypeWait or TypeDone)
+			if task.TaskType == TypeMap || task.TaskType == TypeReduce {
+				finishTaskReq := FinishTaskRequest{
+					WorkerId: workerId,
+					TaskId:   task.TaskId,
+					TaskType: task.TaskType,
+				}
+				finishTaskReply := FinishTaskReply{}
+				TrySend(func() bool {
+					return call("Coordinator.FinishTask", &finishTaskReq, &finishTaskReply)
+				}, 100)
+				reset = finishTaskReply.Reset
+				if reset {
+					if task.TaskType == TypeReduce {
+						if err := os.Remove(tmpFile); err != nil {
+							log.Fatalf("worker %s | doReduceTask | cannot remove file %v", workerId, tmpFile)
+						}
+					}
+					continue
+				}
+				if task.TaskType == TypeReduce && reset == false {
+					outputFilename := fmt.Sprintf("mr-out-%d", task.TaskId)
+					if err := os.Rename(tmpFile, outputFilename); err != nil {
+						os.Remove(tmpFile)
+						log.Fatalf("worker %s | doReduceTask | cannot rename file %v", workerId, tmpFile)
+					}
+				}
 			}
 		}
 	}()
-
+	var currentTask TaskContext
 	for {
-		if taskId == -1 {
-			continue
-		}
+		select {
+		case task := <-taskCh:
+			currentTask = task
 
-		heartbeatReq := HeartbeatRequest{
-			WorkerId: workerId,
-			TaskId:   taskId,
-			TaskType: taskType,
-		}
-		heartbeatReply := HeartbeatReply{}
-		TrySend(func() bool {
-			return call("Coordinator.Heartbeat", &heartbeatReq, &heartbeatReply)
-		}, 100)
-		reset = heartbeatReply.Reset
+		case <-time.After(1 * time.Second):
+			if currentTask.TaskType != TypeWait {
+				heartbeatReq := HeartbeatRequest{
+					WorkerId: workerId,
+					TaskId:   currentTask.TaskId,
+					TaskType: currentTask.TaskType,
+				}
+				heartbeatReply := HeartbeatReply{}
+				TrySend(func() bool {
+					return call("Coordinator.Heartbeat", &heartbeatReq, &heartbeatReply)
+				}, 100)
+				reset = heartbeatReply.Reset
 
-		if complete {
-			break
+				if reset {
+					currentTask.TaskType = TypeWait
+				} else if complete {
+					break
+				}
+			}
 		}
-
-		time.Sleep(1 * time.Second)
 	}
 
 }

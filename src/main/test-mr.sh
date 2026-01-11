@@ -137,7 +137,10 @@ then
   echo '---' indexer test: PASS
 else
   echo '---' indexer output is not the same as mr-correct-indexer.txt
+  echo '---' diff part:
+  diff -u mr-correct-indexer.txt mr-indexer-all | grep -E '^[+-]' | sed 's/^/    /'
   echo '---' indexer test: FAIL
+  exit
   failed_any=1
 fi
 
