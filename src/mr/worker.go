@@ -155,7 +155,13 @@ func doReduceTask(reducef func(string, []string) string, resp *GetIdleTaskReply,
 		}
 	}
 
-	return f.Name()
+	tmpFileName := f.Name()
+	if err := os.Rename(tmpFileName, outputFilename); err != nil {
+		os.Remove(tmpFileName)
+		log.Fatalf("worker %s | doReduceTask | cannot rename file %v", workerId, tmpFileName)
+	}
+
+	return tmpFileName
 }
 
 type TaskContext struct {
@@ -200,7 +206,6 @@ func Worker(mapf func(string, string) []KeyValue,
 				TaskType: reply.TaskType,
 			}
 
-			var tmpFile string
 			//stage 2: do task
 			switch task.TaskType {
 			case TypeMap:
@@ -208,7 +213,7 @@ func Worker(mapf func(string, string) []KeyValue,
 				doMapTask(mapf, &reply, workerId)
 			case TypeReduce:
 				taskCh <- task
-				tmpFile = doReduceTask(reducef, &reply, workerId)
+				doReduceTask(reducef, &reply, workerId)
 			case TypeWait:
 				time.Sleep(1 * time.Second)
 				continue
@@ -230,19 +235,7 @@ func Worker(mapf func(string, string) []KeyValue,
 				}, 100)
 				reset = finishTaskReply.Reset
 				if reset {
-					if task.TaskType == TypeReduce {
-						if err := os.Remove(tmpFile); err != nil {
-							log.Fatalf("worker %s | doReduceTask | cannot remove file %v", workerId, tmpFile)
-						}
-					}
 					continue
-				}
-				if task.TaskType == TypeReduce && reset == false {
-					outputFilename := fmt.Sprintf("mr-out-%d", task.TaskId)
-					if err := os.Rename(tmpFile, outputFilename); err != nil {
-						os.Remove(tmpFile)
-						log.Fatalf("worker %s | doReduceTask | cannot rename file %v", workerId, tmpFile)
-					}
 				}
 			}
 		}
@@ -274,7 +267,6 @@ func Worker(mapf func(string, string) []KeyValue,
 			}
 		}
 	}
-
 }
 
 func TrySend(fn func() bool, waitTime time.Duration) error {
