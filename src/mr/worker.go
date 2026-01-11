@@ -1,15 +1,14 @@
 package mr
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
-	"io/ioutil"
+	"io"
 	"log"
 	"net/rpc"
 	"os"
-	"sync"
+	"sort"
 	"time"
 )
 
@@ -19,81 +18,98 @@ type KeyValue struct {
 	Value string
 }
 
-// use iHash(key) % NReduce to choose the reduce
+// for sorting by key.
+type ByKey []KeyValue
+
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
+
+// use ihash(key) % NReduce to choose the reduce
 // task number for each KeyValue emitted by Map.
-func iHash(key string) int {
+func ihash(key string) int {
 	h := fnv.New32a()
 	h.Write([]byte(key))
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-// main/mrworker.go calls this function.
-func Worker(mapF func(string, string) []KeyValue,
-	reduceF func(string, []string) string) {
+func Worker(mapf func(string, string) []KeyValue,
+	reducef func(string, []string) string) {
 	for {
-		response := doHeartbeat()
-		log.Printf("Worker: receive coordinator's heartbeat %v \n", response)
-		switch response.JobType {
-		case MapJob:
-			doMapTask(mapF, response)
-		case ReduceJob:
-			doReduceTask(reduceF, response)
-		case WaitJob:
-			time.Sleep(1 * time.Second)
-		case CompleteJob:
+		resp := doHeartBeat()
+		switch resp.Task {
+		case TASK_MAP:
+			mapWorker(resp, mapf)
+		case TASK_REDUCE:
+			reduceWorker(resp, reducef)
+		case TASK_WAIT:
+			time.Sleep(time.Second * 1)
+		case TASK_COMPLETE:
 			return
 		default:
-			panic(fmt.Sprintf("unexpected jobType %v", response.JobType))
+			panic(fmt.Sprintf("invalid Task %v", resp.Task))
 		}
 	}
 }
 
-func doMapTask(mapF func(string, string) []KeyValue, response *HeartbeatResponse) {
-	fileName := response.FilePath
-	file, err := os.Open(fileName)
+func mapWorker(resp *HeartBeatResp, mapf func(string, string) []KeyValue) {
+	log.Printf("mapWorker|map worker start|id=%v", resp.Id)
+	defer log.Printf("mapWorker|map worker end|id=%v", resp.Id)
+
+	file, err := os.Open(resp.Filename)
 	if err != nil {
-		log.Fatalf("cannot open %v", fileName)
+		log.Fatalf("mapWorker|open file fail|id=%v|filename=%v", resp.Id, resp.Filename)
 	}
-	content, err := ioutil.ReadAll(file)
+	content, err := io.ReadAll(file)
 	if err != nil {
-		log.Fatalf("cannot read %v", fileName)
+		log.Fatalf("mapWorker|read file fail|id=%v|filename=%v", resp.Id, resp.Filename)
 	}
 	file.Close()
-	kva := mapF(fileName, string(content))
-	intermediates := make([][]KeyValue, response.NReduce)
-	for _, kv := range kva {
-		index := iHash(kv.Key) % response.NReduce
-		intermediates[index] = append(intermediates[index], kv)
+
+	result := mapf(resp.Filename, string(content))
+
+	var encoders []*json.Encoder
+	for i := 0; i < resp.NReduce; i++ {
+		filename := fmt.Sprintf("mr-%v-%v", resp.Id, i+1)
+		file, err := os.Create(filename)
+		if err != nil {
+			log.Fatalf("mapWorker|create file fail|id=%v|filename=%v", resp.Id, filename)
+		}
+		defer file.Close()
+		enc := json.NewEncoder(file)
+		encoders = append(encoders, enc)
 	}
-	var wg sync.WaitGroup
-	for index, intermediate := range intermediates {
-		wg.Add(1)
-		go func(index int, intermediate []KeyValue) {
-			defer wg.Done()
-			intermediateFilePath := generateMapResultFileName(response.Id, index)
-			var buf bytes.Buffer
-			enc := json.NewEncoder(&buf)
-			for _, kv := range intermediate {
-				err := enc.Encode(&kv)
-				if err != nil {
-					log.Fatalf("cannot encode json %v", kv.Key)
-				}
-			}
-			atomicWriteFile(intermediateFilePath, &buf)
-		}(index, intermediate)
+
+	for _, kv := range result {
+		k := ihash(kv.Key) % resp.NReduce
+		err := encoders[k].Encode(kv)
+		if err != nil {
+			log.Fatalf("mapWorker|write file fail|id=%v|kv=%v", resp.Id, kv)
+		}
 	}
-	wg.Wait()
-	doReport(response.Id, MapPhase)
+	doReport(resp)
 }
 
-func doReduceTask(reduceF func(string, []string) string, response *HeartbeatResponse) {
+func reduceWorker(resp *HeartBeatResp, reducef func(string, []string) string) {
+	log.Printf("reduceWorker|reduce worker start|id=%v", resp.Id)
+	defer log.Printf("reduceWorker|reduce worker end|id=%v", resp.Id)
+
+	filename := fmt.Sprintf("mr-out-%v", resp.Id)
+	ofile, err := os.Create(filename)
+	if err != nil {
+		log.Fatalf("reduceWorker|create file fail|id=%v|filename=%v", resp.Id, filename)
+	}
+	defer ofile.Close()
+
 	var kva []KeyValue
-	for i := 0; i < response.NMap; i++ {
-		filePath := generateMapResultFileName(i, response.Id)
-		file, err := os.Open(filePath)
+	for i := 0; i < resp.NMap; i++ {
+		filename := fmt.Sprintf("mr-%v-%v", i+1, resp.Id)
+		file, err := os.Open(filename)
 		if err != nil {
-			log.Fatalf("cannot open %v", filePath)
+			log.Fatalf("reduceWorker|open file fail|id=%v|filename=%v", resp.Id, filename)
 		}
+		defer file.Close()
+
 		dec := json.NewDecoder(file)
 		for {
 			var kv KeyValue
@@ -102,41 +118,67 @@ func doReduceTask(reduceF func(string, []string) string, response *HeartbeatResp
 			}
 			kva = append(kva, kv)
 		}
-		file.Close()
 	}
-	results := make(map[string][]string)
-	// Maybe we need merge sort for larger data
-	for _, kv := range kva {
-		results[kv.Key] = append(results[kv.Key], kv.Value)
+	sort.Sort(ByKey(kva))
+
+	i := 0
+	for i < len(kva) {
+		j := i + 1
+		for j < len(kva) && kva[j].Key == kva[i].Key {
+			j++
+		}
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, kva[k].Value)
+		}
+		output := reducef(kva[i].Key, values)
+		fmt.Fprintf(ofile, "%v %v\n", kva[i].Key, output)
+
+		i = j
 	}
-	var buf bytes.Buffer
-	for key, values := range results {
-		output := reduceF(key, values)
-		fmt.Fprintf(&buf, "%v %v\n", key, output)
-	}
-	atomicWriteFile(generateReduceResultFileName(response.Id), &buf)
-	doReport(response.Id, ReducePhase)
+	doReport(resp)
 }
 
-func doHeartbeat() *HeartbeatResponse {
-	response := HeartbeatResponse{}
-	call("Coordinator.Heartbeat", &HeartbeatRequest{}, &response)
-	return &response
+func doHeartBeat() *HeartBeatResp {
+	req := HeartBeatReq{}
+	resp := HeartBeatResp{}
+	ok := call("Coordinator.HeartBeat", &req, &resp)
+	if ok {
+		log.Printf("callHeartBeat|call succ|req=%v|resp=%v", req, resp)
+	} else {
+		log.Printf("callHeartBeat|call fail|req=%v|resp=%v", req, resp)
+	}
+	return &resp
 }
 
-func doReport(id int, phase SchedulePhase) {
-	call("Coordinator.Report", &ReportRequest{id, phase}, &ReportResponse{})
+func doReport(heartbeatResp *HeartBeatResp) *ReportResp {
+	req := ReportReq{
+		Task: heartbeatResp.Task,
+		Id:   heartbeatResp.Id,
+	}
+	resp := ReportResp{}
+	ok := call("Coordinator.Report", &req, &resp)
+	if ok {
+		log.Printf("callReport|call succ|req=%v|resp=%v", req, resp)
+	} else {
+		log.Printf("callReport|call fail|req=%v|resp=%v", req, resp)
+	}
+	return &resp
 }
 
-func call(rpcName string, args interface{}, reply interface{}) bool {
-	sockName := coordinatorSock()
-	c, err := rpc.DialHTTP("unix", sockName)
+// send an RPC request to the coordinator, wait for the response.
+// usually returns true.
+// returns false if something goes wrong.
+func call(rpcname string, args interface{}, reply interface{}) bool {
+	// c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
+	sockname := coordinatorSock()
+	c, err := rpc.DialHTTP("unix", sockname)
 	if err != nil {
 		log.Fatal("dialing:", err)
 	}
 	defer c.Close()
 
-	err = c.Call(rpcName, args, reply)
+	err = c.Call(rpcname, args, reply)
 	if err == nil {
 		return true
 	}
