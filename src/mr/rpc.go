@@ -7,70 +7,52 @@ package mr
 //
 
 import (
+	"fmt"
 	"os"
 	"strconv"
 )
 
-//
-// example to show how to declare the arguments
-// and reply for an RPC.
-//
-
-type TaskType int
-
-const (
-	TypeMap TaskType = iota
-	TypeReduce
-	TypeWait
-	TypeDone
-)
-
-type GetUidRequest struct{}
-
-type GetUidReply struct {
-	Uid string
+type HeartbeatRequest struct {
 }
 
-type GetIdleTaskRequest struct {
-	WorkerId string
-}
-
-type GetIdleTaskReply struct {
-	TaskId   int
-	TaskType TaskType
-	FileName string
+type HeartbeatResponse struct {
+	FilePath string
+	JobType  JobType
 	NReduce  int
 	NMap     int
+	Id       int
 }
 
-type HeartbeatRequest struct {
-	WorkerId string
-	TaskId   int
-	TaskType TaskType
+func (response HeartbeatResponse) String() string {
+	switch response.JobType {
+	case MapJob:
+		return fmt.Sprintf("{JobType:%v,FilePath:%v,Id:%v,NReduce:%v}", response.JobType, response.FilePath, response.Id, response.NReduce)
+	case ReduceJob:
+		return fmt.Sprintf("{JobType:%v,Id:%v,NMap:%v,NReduce:%v}", response.JobType, response.Id, response.NMap, response.NReduce)
+	case WaitJob, CompleteJob:
+		return fmt.Sprintf("{JobType:%v}", response.JobType)
+	}
+	panic(fmt.Sprintf("unexpected JobType %d", response.JobType))
 }
 
-type HeartbeatReply struct {
-	Reset bool
+type ReportRequest struct {
+	Id    int
+	Phase SchedulePhase
 }
 
-type FinishTaskRequest struct {
-	WorkerId string
-	TaskId   int
-	TaskType TaskType
+func (request ReportRequest) String() string {
+	return fmt.Sprintf("{Id:%v,SchedulePhase:%v}", request.Id, request.Phase)
 }
 
-type FinishTaskReply struct {
-	Reset bool
+type ReportResponse struct {
 }
-
-// Add your RPC definitions here.
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
 // Can't use the current directory since
 // Athena AFS doesn't support UNIX-domain sockets.
 func coordinatorSock() string {
-	s := "/var/tmp/5840-mr-"
+	s := "/var/tmp/824-mr-"
 	s += strconv.Itoa(os.Getuid())
 	return s
 }
