@@ -72,7 +72,7 @@ func (c *Coordinator) server() {
 	os.Remove(sockname)
 	l, e := net.Listen("unix", sockname)
 	if e != nil {
-		log.Fatal("listen error:", e)
+		log.Fatal("[ERROR] listen error:", e)
 	}
 	go http.Serve(l, nil)
 }
@@ -84,6 +84,7 @@ func (c *Coordinator) Done() bool {
 }
 
 func (c *Coordinator) GetIdleTask(req *GetIdleTaskRequest, resp *GetIdleTaskReply) error {
+	log.Printf("[DEBUG] Coordinator: GetIdleTask received from worker %s", req.WorkerId)
 	taskEvent := TaskEvent{
 		TaskEventType: TaskEventAssign,
 		WorkerId:      req.WorkerId,
@@ -92,6 +93,8 @@ func (c *Coordinator) GetIdleTask(req *GetIdleTaskRequest, resp *GetIdleTaskRepl
 	}
 	c.taskChan <- taskEvent
 	<-taskEvent.ok
+
+	log.Printf("[DEBUG] Coordinator: GetIdleTask completed for worker %s, task type %v", req.WorkerId, resp.TaskType)
 	return nil
 }
 
@@ -109,8 +112,8 @@ func (c *Coordinator) GetUid(req *GetUidRequest, resp *GetUidReply) error {
 
 // Heartbeat handles RPC request to update task heartbeat
 func (c *Coordinator) Heartbeat(req *HeartbeatRequest, resp *HeartbeatReply) error {
-	log.Printf("Coordinator: Heartbeat received from worker %s for task %d of type %s", req.WorkerId, req.TaskId, req.TaskType)
-	defer log.Printf("Coordinator: Hearbeat finish from from worker %s for task %d of type %s", req.WorkerId, req.TaskId, req.TaskType)
+	log.Printf("[INFO] Coordinator: Heartbeat received from worker %s for task %d of type %v", req.WorkerId, req.TaskId, req.TaskType)
+	defer log.Printf("[INFO] Coordinator: Hearbeat finish from from worker %s for task %d of type %v", req.WorkerId, req.TaskId, req.TaskType)
 
 	taskEvent := TaskEvent{
 		TaskEventType: TaskEventHeartbeat,
@@ -128,7 +131,7 @@ func (c *Coordinator) Heartbeat(req *HeartbeatRequest, resp *HeartbeatReply) err
 
 // FinishTask handles RPC request to report task completion
 func (c *Coordinator) FinishTask(req *FinishTaskRequest, resp *FinishTaskReply) error {
-	log.Printf("Coordinator: FinishTask received from worker %s for task %d of type %s", req.WorkerId, req.TaskId, req.TaskType)
+	log.Printf("[DEBUG] Coordinator: FinishTask received from worker %s for task %d of type %v", req.WorkerId, req.TaskId, req.TaskType)
 
 	taskEvent := TaskEvent{
 		TaskEventType: TaskEventComplete,
@@ -141,7 +144,7 @@ func (c *Coordinator) FinishTask(req *FinishTaskRequest, resp *FinishTaskReply) 
 	c.taskChan <- taskEvent
 	<-taskEvent.ok
 
-	log.Printf("Coordinator: FinishTask completed for worker %s, task %d, reset=%v", req.WorkerId, req.TaskId, resp.Reset)
+	log.Printf("[DEBUG] Coordinator: FinishTask completed for worker %s, task %d, type=%v, reset=%v", req.WorkerId, req.TaskId, req.TaskType, resp.Reset)
 	return nil
 }
 
@@ -166,6 +169,12 @@ func (c *Coordinator) assignIdleTask(workerId string, resp *GetIdleTaskReply) (*
 		resp.TaskType = TypeWait
 		return resp, nil
 	} else if c.phase == PhaseReduce {
+		successWorkerId := make([]string, 0)
+		for _, task := range c.mapTasks {
+			if task.status == StatusDone {
+				successWorkerId = append(successWorkerId, task.assignedWorkerId)
+			}
+		}
 		for i := range c.reduceTasks {
 			task := &c.reduceTasks[i]
 			if task.status == StatusIdle {
@@ -177,6 +186,7 @@ func (c *Coordinator) assignIdleTask(workerId string, resp *GetIdleTaskReply) (*
 				resp.TaskType = TypeReduce
 				resp.NMap = len(c.mapTasks)
 				resp.NReduce = len(c.reduceTasks)
+				resp.SuccessWorkerId = successWorkerId
 				return resp, nil
 			}
 		}
@@ -219,7 +229,7 @@ func (c *Coordinator) checkTasks() {
 		// If all map tasks are done, switch to reduce phase
 		if mapDone {
 			c.phase = PhaseReduce
-			log.Printf("Coordinator: All map tasks completed, switching to reduce phase")
+			log.Printf("[INFO] Coordinator: All map tasks completed, switching to reduce phase")
 		}
 	}
 
@@ -243,7 +253,7 @@ func (c *Coordinator) checkTasks() {
 		}
 		if reduceDone {
 			c.phase = PhaseDone
-			log.Printf("Coordinator: All reduce tasks completed, switching to done phase")
+			log.Printf("[INFO] Coordinator: All reduce tasks completed, switching to done phase")
 		}
 	}
 }
@@ -256,6 +266,7 @@ func (c *Coordinator) completeTask(workerId string, taskId int, taskType TaskTyp
 				// If task is already done, ignore the completion request
 				if task.status == StatusDone {
 					resp.Reset = true
+					log.Printf("[WARN] Coordinator: FinishTask completed for worker %s, task %d, type=%v, but task is already done", workerId, taskId, taskType)
 					return nil
 				}
 				if workerId == task.assignedWorkerId && task.status == StatusProcessing {
@@ -263,6 +274,7 @@ func (c *Coordinator) completeTask(workerId string, taskId int, taskType TaskTyp
 					resp.Reset = false
 
 				} else {
+					log.Printf("[WARN] Coordinator: FinishTask completed for worker %s, task %d, type=%v, but task is already done", workerId, taskId, taskType)
 					resp.Reset = true
 				}
 				return nil
@@ -273,6 +285,7 @@ func (c *Coordinator) completeTask(workerId string, taskId int, taskType TaskTyp
 			task := &c.reduceTasks[i]
 			if task.id == taskId {
 				if task.status == StatusDone {
+					log.Printf("[WARN] Coordinator: FinishTask completed for worker %s, task %d, type=%v, but task is already done", workerId, taskId, taskType)
 					resp.Reset = true
 					return nil
 				}
@@ -280,6 +293,7 @@ func (c *Coordinator) completeTask(workerId string, taskId int, taskType TaskTyp
 					task.status = StatusDone
 					resp.Reset = false
 				} else {
+					log.Printf("[WARN] Coordinator: FinishTask completed for worker %s, task %d, type=%v, but task is already done", workerId, taskId, taskType)
 					resp.Reset = true
 				}
 				return nil
@@ -335,6 +349,7 @@ func (c *Coordinator) updateHeartbeat(workerId string, taskId int, taskType Task
 
 				} else {
 					// 当前任务被分配给了其他 worker
+					log.Printf("[WARN] Coordinator: Heartbeat received for task %d, type=%v, but task is already assigned to worker %s", taskId, taskType, task.assignedWorkerId)
 					resp.Reset = true
 					return false, nil
 				}
@@ -351,6 +366,7 @@ func (c *Coordinator) updateHeartbeat(workerId string, taskId int, taskType Task
 
 				} else {
 					// 当前任务被分配给了其他 worker
+					log.Printf("[WARN] Coordinator: Heartbeat received for task %d, type=%v, but task is already assigned to worker %s", taskId, taskType, task.assignedWorkerId)
 					resp.Reset = true
 					return false, nil
 				}

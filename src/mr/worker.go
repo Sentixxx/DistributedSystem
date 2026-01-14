@@ -28,15 +28,16 @@ func ihash(key string) int {
 }
 
 func doMapTask(mapf func(string, string) []KeyValue, resp *GetIdleTaskReply, workerId string) {
+	log.Printf("MAP task %d worker %s filename=%q", resp.TaskId, workerId, resp.FileName)
 	filename := resp.FileName
 	file, err := os.Open(filename)
 	if err != nil {
-		log.Fatalf("worker %s | doMapTask | cannot open file %v", workerId, filename)
+		log.Fatalf("[ERROR] worker %s | doMapTask | cannot open file %v", workerId, filename)
 	}
 	defer file.Close()
 	content, err := io.ReadAll(file)
 	if err != nil {
-		log.Fatalf("worker %s | doMapTask | cannot read file %v", workerId, filename)
+		log.Fatalf("[ERROR] worker %s | doMapTask | cannot read file %v", workerId, filename)
 	}
 
 	kva := mapf(filename, string(content))
@@ -50,7 +51,7 @@ func doMapTask(mapf func(string, string) []KeyValue, resp *GetIdleTaskReply, wor
 		sort.Slice(intermediate[i], func(j, k int) bool {
 			return intermediate[i][j].Key < intermediate[i][k].Key
 		})
-		filename := fmt.Sprintf("mr-%d-%d", resp.TaskId, i)
+		filename := fmt.Sprintf("mr-%d-%d-%s", resp.TaskId, i, workerId)
 
 		// Use atomic write: create temp file, write, then rename
 		dir, _ := filepath.Split(filename)
@@ -59,7 +60,7 @@ func doMapTask(mapf func(string, string) []KeyValue, resp *GetIdleTaskReply, wor
 		}
 		tmpfile, err := os.CreateTemp(dir, "mr-tmp-*")
 		if err != nil {
-			log.Fatalf("worker %s | doMapTask | cannot create temp file %v", workerId, filename)
+			log.Fatalf("[ERROR] worker %s | doMapTask | cannot create temp file %v", workerId, filename)
 		}
 
 		encoding := json.NewEncoder(tmpfile)
@@ -68,20 +69,20 @@ func doMapTask(mapf func(string, string) []KeyValue, resp *GetIdleTaskReply, wor
 			if err != nil {
 				tmpfile.Close()
 				os.Remove(tmpfile.Name())
-				log.Fatalf("worker %s | doMapTask | cannot encode kv %v", workerId, kv)
+				log.Fatalf("[ERROR] worker %s | doMapTask | cannot encode kv %v", workerId, kv)
 			}
 		}
 
 		// Close file before renaming to ensure data is flushed
 		if err := tmpfile.Close(); err != nil {
 			os.Remove(tmpfile.Name())
-			log.Fatalf("worker %s | doMapTask | cannot close temp file %v", workerId, tmpfile.Name())
+			log.Fatalf("[ERROR] worker %s | doMapTask | cannot close temp file %v", workerId, tmpfile.Name())
 		}
 
 		// Atomic rename: only visible after complete write
 		if err := os.Rename(tmpfile.Name(), filename); err != nil {
 			os.Remove(tmpfile.Name())
-			log.Fatalf("worker %s | doMapTask | cannot rename file %v", workerId, filename)
+			log.Fatalf("[ERROR] worker %s | doMapTask | cannot rename file %v", workerId, filename)
 		}
 	}
 
@@ -93,9 +94,10 @@ func doReduceTask(reducef func(string, []string) string, resp *GetIdleTaskReply,
 
 	intermediate := make([]KeyValue, 0)
 	for i := 0; i < resp.NMap; i++ {
-		filename := fmt.Sprintf("mr-%d-%d", i, resp.TaskId)
+		filename := fmt.Sprintf("mr-%d-%d-%s", i, resp.TaskId, resp.SuccessWorkerId[i])
 		file, err := os.Open(filename)
 		if err != nil {
+			log.Printf("[WARN] reduce %d missing map output mr-%d-%d-%s", resp.TaskId, i, resp.TaskId, resp.SuccessWorkerId[i])
 			// File might not exist if map task failed or not completed yet
 			continue
 		}
@@ -132,7 +134,7 @@ func doReduceTask(reducef func(string, []string) string, resp *GetIdleTaskReply,
 	}
 	f, err := os.CreateTemp(dir, "mr-tmp-*")
 	if err != nil {
-		log.Fatalf("worker %s | doReduceTask | cannot create temp file %v", workerId, filename)
+		log.Fatalf("[ERROR] worker %s | doReduceTask | cannot create temp file %v", workerId, filename)
 	}
 
 	// Write output in sorted order
@@ -144,21 +146,21 @@ func doReduceTask(reducef func(string, []string) string, resp *GetIdleTaskReply,
 	// Close file before renaming
 	if err := f.Close(); err != nil {
 		os.Remove(f.Name())
-		log.Fatalf("worker %s | doReduceTask | cannot close temp file %v", workerId, f.Name())
+		log.Fatalf("[ERROR] worker %s | doReduceTask | cannot close temp file %v", workerId, f.Name())
 	}
 
 	// Copy file permissions if target file exists
 	if info, err := os.Stat(filename); err == nil {
 		if err := os.Chmod(f.Name(), info.Mode()); err != nil {
 			os.Remove(f.Name())
-			log.Fatalf("worker %s | doReduceTask | cannot chmod file %v", workerId, filename)
+			log.Fatalf("[ERROR] worker %s | doReduceTask | cannot chmod file %v", workerId, filename)
 		}
 	}
 
 	tmpFileName := f.Name()
 	if err := os.Rename(tmpFileName, outputFilename); err != nil {
 		os.Remove(tmpFileName)
-		log.Fatalf("worker %s | doReduceTask | cannot rename file %v", workerId, tmpFileName)
+		log.Fatalf("[ERROR] worker %s | doReduceTask | cannot rename file %v", workerId, tmpFileName)
 	}
 
 	return tmpFileName
@@ -219,7 +221,7 @@ func Worker(mapf func(string, string) []KeyValue,
 				continue
 			case TypeDone:
 				complete = true
-				break
+				return
 			}
 
 			//stage 3: finish task (only for actual tasks, not TypeWait or TypeDone)
@@ -262,7 +264,7 @@ func Worker(mapf func(string, string) []KeyValue,
 				if reset {
 					currentTask.TaskType = TypeWait
 				} else if complete {
-					break
+					return
 				}
 			}
 		}
@@ -270,7 +272,9 @@ func Worker(mapf func(string, string) []KeyValue,
 }
 
 func TrySend(fn func() bool, waitTime time.Duration) error {
-	for {
+	maxRetry := 10
+	for i := 0; i < maxRetry; i++ {
+
 		ok := fn()
 		if ok {
 			return nil
@@ -278,6 +282,7 @@ func TrySend(fn func() bool, waitTime time.Duration) error {
 			time.Sleep(waitTime * time.Millisecond)
 		}
 	}
+	return fmt.Errorf("[ERROR] failed to send RPC after %d retries", maxRetry)
 }
 
 // send an RPC request to the coordinator, wait for the response.
@@ -288,7 +293,7 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 	sockname := coordinatorSock()
 	c, err := rpc.DialHTTP("unix", sockname)
 	if err != nil {
-		log.Fatal("dialing:", err)
+		log.Fatal("[ERROR] dialing:", err)
 	}
 	defer c.Close()
 

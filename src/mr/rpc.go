@@ -36,11 +36,12 @@ type GetIdleTaskRequest struct {
 }
 
 type GetIdleTaskReply struct {
-	TaskId   int
-	TaskType TaskType
-	FileName string
-	NReduce  int
-	NMap     int
+	TaskId          int
+	TaskType        TaskType
+	FileName        string
+	NReduce         int
+	NMap            int
+	SuccessWorkerId []string
 }
 
 type HeartbeatRequest struct {

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 
+# exec > all.log 2>&1
 #
 # map-reduce tests
 #
@@ -20,11 +21,12 @@ then
 fi
 
 ISQUIET=$1
+GOLOG=go.log
 maybe_quiet() {
     if [ "$ISQUIET" == "quiet" ]; then
-      "$@" > /dev/null 2>&1
+      "$@" 2>&1
     else
-      "$@"
+      "$@" 
     fi
 }
 
